@@ -11,6 +11,9 @@ checklist.
 
 ## [Unreleased]
 
+- **`GET /metrics` — Prometheus text exposition** (dario#1341) — the rolling window, per-seat utilization, per-model / per-consumer request and API-equivalent cost, queue depth and stall, latency quantiles over the recent records, burn rates, and the ledger's lifetime numbers, in the format every scraper reads. A view over state dario already keeps; a scrape costs what `GET /analytics` costs. Same gate as `/analytics`.
+- **`--analytics-token` / `DARIO_ANALYTICS_TOKEN`** — a read-only credential accepted on `/analytics*` and `/metrics` only, so a Grafana box or a browser tab can hold the numbers without holding request rights. On a keyed proxy the root key keeps working there too; on an unkeyed proxy it gates nothing and says so.
+- **Spend donuts** — `dario usage --donut[=file.svg]` and `GET /analytics/donuts.svg` draw the API-equivalent number as three rings: by model, by key, and covered-vs-metered. `GET /analytics/ui` is a self-contained dashboard page (no data in the page; it asks for the token once, keeps it in sessionStorage, and refreshes `/analytics/view` every 60 s) with the headline, the rings, the rolling window and per-model / per-seat tables.
 - **`dario proxy` no longer starts on a stray word** (dario#1353) — `dario proxy status`, `dario proxy stop`, or any bare argument after `proxy` used to be ignored and a full proxy started, refresh timer and all; one such typo ran for five days and rotated the shared Claude credential out from under an interactive session. A bare word is now an error that starts nothing, and `dario proxy status` is an alias for `dario status`.
 
 ## [6.8.11] - 2026-09-18
