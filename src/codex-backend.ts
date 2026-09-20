@@ -24,6 +24,7 @@
 import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { CodexAccountCredentials } from './codex-accounts.js';
+import { timingHeaders } from './timing.js';
 import { forceRefreshCodexAccount } from './codex-accounts.js';
 import {
   anthropicToResponsesRequest,
@@ -140,6 +141,10 @@ export async function fetchCodexModels(
 export interface CodexForwardOutcome {
   status: number;
   latencyMs: number;
+  /** First outbound fetch → upstream response headers, ms: the seat's time to first byte (the served attempt when a refresh forced a retry). 0 when nothing went out. */
+  upstreamTtfbMs: number;
+  /** First outbound fetch → the report, ms: the seat's time including its body. 0 when nothing went out. */
+  upstreamMs: number;
   /** Net of the cached prefix (Anthropic convention; see splitResponsesUsage). */
   inputTokens: number;
   outputTokens: number;
@@ -983,15 +988,36 @@ export async function forwardResponsesToCodex(
    *  retry the request on a healthy peer. False keeps the old behaviour: the
    *  upstream error is written through as the backend sent it. */
   deferOnUnavailable = false,
+  /** Queue wait and arrival stamp from the proxy: the response carries the timing headers (src/timing.ts) like a Claude-path response does. */
+  timing?: { queueMs: number; arrivedAt: number },
 ): Promise<boolean> {
   const startedAt = Date.now();
+  // Timing split (src/timing.ts): the first outbound fetch and the headers of
+  // the attempt that was served. A refresh-and-retry keeps the first start —
+  // the rejected attempt was the seat's time too.
+  let fetchStartedAt = 0;
+  let upstreamHeadersAt = 0;
+  const timedFetch: typeof fetch = async (input, init) => {
+    if (!fetchStartedAt) fetchStartedAt = Date.now();
+    const r = await fetchImpl(input, init);
+    upstreamHeadersAt = Date.now();
+    return r;
+  };
+  const ttfbMs = (): number => (fetchStartedAt && upstreamHeadersAt ? Math.max(0, upstreamHeadersAt - fetchStartedAt) : 0);
+  const upstreamMsNow = (): number => (fetchStartedAt ? Math.max(0, Date.now() - fetchStartedAt) : 0);
+  // The four x-dario-*-ms headers, merged into every response this leg writes
+  // once the backend has answered. The governor never runs for codex: pacing 0.
+  const splitHeaders = (): Record<string, string> => timingHeaders({
+    queueMs: timing?.queueMs ?? 0, pacingMs: 0, arrivedAt: timing?.arrivedAt ?? startedAt,
+    fetchStartedAt: fetchStartedAt || Date.now(), upstreamTtfbMs: ttfbMs(),
+  });
   const model = String(body.model ?? '');
   let reported = false;
   const report = (status: number, usage: CodexTokenUsage | null): void => {
     if (reported || !onDone) return;
     reported = true;
     try {
-      onDone({ status, latencyMs: Date.now() - startedAt, inputTokens: usage?.input ?? 0, outputTokens: usage?.output ?? 0,
+      onDone({ status, latencyMs: Date.now() - startedAt, upstreamTtfbMs: ttfbMs(), upstreamMs: upstreamMsNow(), inputTokens: usage?.input ?? 0, outputTokens: usage?.output ?? 0,
         cacheReadTokens: usage?.cacheRead ?? 0, cacheCreateTokens: usage?.cacheCreate ?? 0, stream: true, model, alias: creds.alias });
     } catch { /* never break a served request */ }
   };
@@ -1017,13 +1043,13 @@ export async function forwardResponsesToCodex(
   try {
     if (verbose) console.log(`[dario] → codex backend (responses passthrough): ${target} (model: ${model})`);
     let activeCreds = creds;
-    let upstream = await fetchImpl(target, { method: 'POST', headers: buildCodexHeaders(activeCreds), body: JSON.stringify(upstreamBody), signal: abort.signal });
+    let upstream = await timedFetch(target, { method: 'POST', headers: buildCodexHeaders(activeCreds), body: JSON.stringify(upstreamBody), signal: abort.signal });
     if (isCodexAuthFailure(upstream.status)) {
       await upstream.text().catch(() => ''); // release the rejected response before retrying
       const fresh = await refreshAfterCodexAuthFailure(activeCreds, verbose);
       if (fresh) {
         activeCreds = fresh;
-        upstream = await fetchImpl(target, { method: 'POST', headers: buildCodexHeaders(activeCreds), body: JSON.stringify(upstreamBody), signal: abort.signal });
+        upstream = await timedFetch(target, { method: 'POST', headers: buildCodexHeaders(activeCreds), body: JSON.stringify(upstreamBody), signal: abort.signal });
       }
     }
     if (!upstream.ok || !upstream.body) {
@@ -1047,14 +1073,14 @@ export async function forwardResponsesToCodex(
         return false;
       }
       if (!clientGone) {
-        res.writeHead(upstream.status, { 'Content-Type': 'application/json', ...securityHeaders });
+        res.writeHead(upstream.status, { 'Content-Type': 'application/json', ...securityHeaders, ...splitHeaders() });
         // The backend's own error body, already in the client's shape.
         res.end(detail || JSON.stringify({ error: { message: 'Upstream Codex backend error', type: 'server_error', code: null, param: null } }));
       }
       report(clientGone ? 499 : upstream.status, null);
       return true;
     }
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': corsOrigin, ...securityHeaders });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': corsOrigin, ...securityHeaders, ...splitHeaders() });
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
     let tail = '';
@@ -1167,6 +1193,8 @@ export async function forwardToCodex(
    * pool instead of ending truncated.
    */
   midstream?: MidstreamGuard | null,
+  /** Queue wait and arrival stamp from the proxy: the response carries the timing headers (src/timing.ts) like a Claude-path response does. */
+  timing?: { queueMs: number; arrivedAt: number },
 ): Promise<boolean> {
   void req;
   const isAnthropic = shape === 'anthropic';
@@ -1174,13 +1202,32 @@ export async function forwardToCodex(
   // this the proxy had no idea a codex request happened: no analytics row, no
   // log line, no per-account count.
   const startedAt = Date.now();
+  // Timing split (src/timing.ts): the first outbound fetch and the headers of
+  // the attempt that was served. A refresh-and-retry keeps the first start —
+  // the rejected attempt was the seat's time too.
+  let fetchStartedAt = 0;
+  let upstreamHeadersAt = 0;
+  const timedFetch: typeof fetch = async (input, init) => {
+    if (!fetchStartedAt) fetchStartedAt = Date.now();
+    const r = await fetchImpl(input, init);
+    upstreamHeadersAt = Date.now();
+    return r;
+  };
+  const ttfbMs = (): number => (fetchStartedAt && upstreamHeadersAt ? Math.max(0, upstreamHeadersAt - fetchStartedAt) : 0);
+  const upstreamMsNow = (): number => (fetchStartedAt ? Math.max(0, Date.now() - fetchStartedAt) : 0);
+  // The four x-dario-*-ms headers, merged into every response this leg writes
+  // once the backend has answered. The governor never runs for codex: pacing 0.
+  const splitHeaders = (): Record<string, string> => timingHeaders({
+    queueMs: timing?.queueMs ?? 0, pacingMs: 0, arrivedAt: timing?.arrivedAt ?? startedAt,
+    fetchStartedAt: fetchStartedAt || Date.now(), upstreamTtfbMs: ttfbMs(),
+  });
   let reported = false;
   const report = (status: number, usage: CodexTokenUsage | null, stream: boolean, model: string): void => {
     if (reported || !onDone) return;
     reported = true;
     try {
       onDone({
-        status, latencyMs: Date.now() - startedAt,
+        status, latencyMs: Date.now() - startedAt, upstreamTtfbMs: ttfbMs(), upstreamMs: upstreamMsNow(),
         inputTokens: usage?.input ?? 0, outputTokens: usage?.output ?? 0,
         cacheReadTokens: usage?.cacheRead ?? 0, cacheCreateTokens: usage?.cacheCreate ?? 0,
         stream, model, alias: creds.alias,
@@ -1256,7 +1303,7 @@ export async function forwardToCodex(
   try {
     if (verbose) console.log(`[dario] → codex backend: ${target} (model: ${model})`);
     let activeCreds = creds;
-    let upstream = await fetchImpl(target, {
+    let upstream = await timedFetch(target, {
       method: 'POST',
       headers: buildCodexHeaders(activeCreds),
       body: JSON.stringify(scrubbed),
@@ -1269,7 +1316,7 @@ export async function forwardToCodex(
       const fresh = await refreshAfterCodexAuthFailure(activeCreds, verbose);
       if (fresh) {
         activeCreds = fresh;
-        upstream = await fetchImpl(target, {
+        upstream = await timedFetch(target, {
           method: 'POST',
           headers: buildCodexHeaders(activeCreds),
           body: JSON.stringify(scrubbed),
@@ -1319,7 +1366,7 @@ export async function forwardToCodex(
         // (the decline was already recorded above, for both exits)
         return false;
       }
-      res.writeHead(upstream.status, { 'Content-Type': 'application/json', ...securityHeaders });
+      res.writeHead(upstream.status, { 'Content-Type': 'application/json', ...securityHeaders, ...splitHeaders() });
       res.end(errBody('Upstream Codex backend error', { status: upstream.status, account: creds.alias }));
       report(upstream.status, null, clientWantsStream, model);
       return true;
@@ -1370,6 +1417,7 @@ export async function forwardToCodex(
         'Connection': 'keep-alive',
         'Access-Control-Allow-Origin': corsOrigin,
         ...securityHeaders,
+        ...splitHeaders(),
       });
     }
 
@@ -1448,6 +1496,7 @@ export async function forwardToCodex(
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': corsOrigin,
           ...securityHeaders,
+          ...splitHeaders(),
         });
         antAssembler!.push(antTranslator!.end());
         finished = true;
@@ -1461,6 +1510,7 @@ export async function forwardToCodex(
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': corsOrigin,
         ...securityHeaders,
+        ...splitHeaders(),
       });
       finished = true;
       res.end(JSON.stringify(translator!.complete()));
