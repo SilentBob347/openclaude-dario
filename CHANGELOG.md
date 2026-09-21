@@ -11,6 +11,37 @@ checklist.
 
 ## [Unreleased]
 
+## [6.10.0] - 2026-09-20
+
+### Added
+
+- **Per-key daily budgets** (dario#1318's "implement quota split"; the reason a LiteLLM was being put
+  in front of dario). `dario keys create alice --budget=$5/day --budget-tokens=2M/day`, or
+  `dario keys budget alice --budget=$5/day` on an existing key (`--clear` removes it), caps what a
+  named key may use per UTC day: the API-equivalent price of its traffic — the number
+  `dario usage --by-key` prints, covered and metered both — and/or every token it sent or
+  received, cache reads included. The check runs at request start against the ledger's completed
+  rows plus what is reserved for the key's requests still in flight — each at an upper bound on its
+  cost from what dario will send (the client's body plus the template's system prompt and tools at
+  3 bytes per token priced as cache-create, which bounds any mix of input / cache-read /
+  cache-create; plus the `max_tokens` that goes on the wire — the template's 64,000 default unless
+  `--max-tokens=client` — at the output rate) until the ledger has the real number — so the most a
+  key completes in a day is the cap plus one request whatever the burst; it survives a restart and
+  every dollar is traceable; a request past the cap is refused
+  with `429` in its own wire shape (`rate_limit_error`; OpenAI shape adds `code:
+  "key_budget_exceeded"`), a `retry-after` at the UTC day boundary and `reject: "key-budget-usd"`
+  / `"key-budget-tokens"` on the log line. Served responses carry `x-dario-budget-key`, `-usd`,
+  `-used-usd`, `-tokens`, `-used-tokens` and `-resets-at` so a client can watch its own headroom.
+  `GET /analytics` gains `budgets` (every budgeted key with today's use); `GET /metrics` gains
+  `dario_key_budget_usd_per_day`, `_used_usd`, `_tokens_per_day`, `_used_tokens` per key;
+  `dario keys list` gains a BUDGET column; `POST /admin/keys` accepts `budget_usd_per_day` /
+  `budget_tokens_per_day` and `POST /admin/keys/<name>/budget` sets or clears one live, audited
+  as `key_budget`. With the ledger off a budget cannot be read: the proxy names the affected keys
+  at startup and serves them as if they had none. `test/keys-budget.mjs` (51, pure),
+  `test/keys-budget-proxy.mjs` (through a real proxy: served / served / refused on both caps, both
+  wire shapes, headers, live changes from CLI and admin API, /analytics, /metrics, ledger off).
+  Docs: `docs/keys.md` gains **Budgets**.
+
 ## [6.9.3] - 2026-09-20
 
 ### Fixed
