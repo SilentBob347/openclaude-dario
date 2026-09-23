@@ -228,11 +228,9 @@ MIT — see [LICENSE](LICENSE) and [DISCLAIMER.md](DISCLAIMER.md). The embedded 
 dario is the routing layer of **[Own Your Stack](https://github.com/askalf)**, open tools for owning your AI infrastructure instead of renting it by the token. One subscription. Your box. Your terms.
 
 - **[dario](https://github.com/askalf/dario)** — own your routing _(you are here)_
-- **[hybrid](https://github.com/askalf/hybrid)** — own your inference
 - **[browser-bridge](https://github.com/askalf/browser-bridge)** — own your browser
 - **[redstamp](https://github.com/askalf/redstamp)** — own your agent security
 - **[truecopy](https://github.com/askalf/truecopy)** — own your agent skills
-- **[agent-security-stack](https://github.com/askalf/agent-security-stack)** — own your agent security stack: redstamp + truecopy + strongroom leases, one MCP server
 - **[cordon](https://github.com/askalf/cordon)** — own your prompts · [pair it with dario](./docs/integrations/cordon.md)
 - **[plumbline](https://github.com/askalf/plumbline)** — own your agent oversight
 - **[amnesia](https://github.com/askalf/amnesia)** — own your search
